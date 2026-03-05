@@ -1,5 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from flask import Flask, request, jsonify
 import requests
 import json
 import base64
@@ -8,10 +7,10 @@ import time
 import multiprocessing
 from typing import Tuple, Optional
 
-app = FastAPI(title="CEIR Myanmar IMEI Checker API")
+app = Flask(__name__)
 
 CHALLENGE_URL = "https://ceir.gov.mm/openapi/API/Auth/altcha/altcha"
-VERIFY_URL = "https://ceir.gov.mm/openapi/API/IMEI/Verify"
+VERIFY_URL    = "https://ceir.gov.mm/openapi/API/IMEI/Verify"
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -23,34 +22,38 @@ HEADERS = {
 }
 
 def fetch_challenge() -> dict:
-    r = requests.get(CHALLENGE_URL, headers=HEADERS, timeout=12)
+    r = requests.get(CHALLENGE_URL, headers=HEADERS)
     r.raise_for_status()
     return r.json()
 
 def solve_pow_worker(args: Tuple[str, str, int, int]) -> Optional[int]:
     salt, challenge, start, end = args
     for number in range(start, end + 1):
-        if hashlib.sha256((salt + str(number)).encode()).hexdigest() == challenge:
+        input_str = salt + str(number)
+        if hashlib.sha256(input_str.encode('utf-8')).hexdigest() == challenge:
             return number
     return None
 
 def solve_pow(salt: str, challenge: str, maxnumber: int) -> Tuple[int, int]:
     start_time = time.time()
-    workers = max(2, multiprocessing.cpu_count() // 2)  # Vercel has limited CPU
-    chunk = (maxnumber + 1) // workers
-    ranges = [(salt, challenge, i*chunk, min((i+1)*chunk-1, maxnumber)) for i in range(workers)]
+    workers = max(2, multiprocessing.cpu_count() // 2)  # safe for Vercel
+    chunk_size = (maxnumber + 1) // workers
+    ranges = [
+        (salt, challenge, i * chunk_size, min((i + 1) * chunk_size - 1, maxnumber))
+        for i in range(workers)
+    ]
 
-    with multiprocessing.Pool(workers) as pool:
+    with multiprocessing.Pool(processes=workers) as pool:
         results = pool.map(solve_pow_worker, ranges)
 
-    number = next((x for x in results if x is not None), None)
+    number = next((res for res in results if res is not None), None)
     if number is None:
-        raise ValueError("PoW failed - challenge likely expired")
-    
-    took = int((time.time() - start_time) * 1000)
-    return number, took
+        raise ValueError("No solution found — challenge probably expired")
 
-def build_altcha(challenge_data: dict, number: int, took: int) -> str:
+    took_ms = int((time.time() - start_time) * 1000)
+    return number, took_ms
+
+def build_altcha_token(challenge_data: dict, number: int, took: int) -> str:
     payload = {
         "algorithm": challenge_data["algorithm"],
         "challenge": challenge_data["challenge"],
@@ -59,36 +62,55 @@ def build_altcha(challenge_data: dict, number: int, took: int) -> str:
         "signature": challenge_data["signature"],
         "took": took
     }
-    return base64.b64encode(json.dumps(payload, separators=(',', ':')).encode()).decode()
+    json_str = json.dumps(payload, separators=(',', ':'))
+    return base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
 
 def verify_imei(imei: str, altcha: str) -> dict:
     url = f"{VERIFY_URL}?altcha={altcha}"
     payload = [imei]
-    r = requests.post(url, headers=HEADERS, json=payload, timeout=15)
+
+    # NO TIMEOUT → waits forever until response or connection dies
+    r = requests.post(url, headers=HEADERS, data=json.dumps(payload))
     r.raise_for_status()
     return r.json()
 
-@app.get("/check")
-async def check(imei: str = Query(..., description="15-digit IMEI")):
-    if not imei.isdigit() or len(imei) != 15:
-        raise HTTPException(400, detail="IMEI must be exactly 15 digits")
+@app.route('/check', methods=['GET'])
+def check_imei():
+    imei = request.args.get('imei')
+    if not imei or not imei.isdigit() or len(imei) != 15:
+        return jsonify({"error": "IMEI must be exactly 15 digits"}), 400
 
     try:
-        chall = fetch_challenge()
-        number, took = solve_pow(chall["salt"], chall["challenge"], chall["maxnumber"])
-        altcha_token = build_altcha(chall, number, took)
-        result = verify_imei(imei, altcha_token)
+        challenge_data = fetch_challenge()
+        number, took = solve_pow(
+            challenge_data["salt"],
+            challenge_data["challenge"],
+            challenge_data["maxnumber"]
+        )
+        altcha = build_altcha_token(challenge_data, number, took)
+        result = verify_imei(imei, altcha)
 
-        return {
+        return jsonify({
             "status": "success",
             "imei": imei,
             "solved_number": number,
             "took_ms": took,
-            "ceir_response": result
-        }
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
+            "ceir_result": result
+        })
 
-@app.get("/")
-async def root():
-    return {"message": "CEIR IMEI Checker API - use /check?imei=xxxxxxxxxxxxxxx"}
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "imei": imei if 'imei' in locals() else None
+        }), 500
+
+@app.route('/')
+def home():
+    return jsonify({
+        "message": "CEIR Myanmar IMEI Checker (Flask on Vercel)",
+        "usage": "/check?imei=865163040845331"
+    })
+
+if __name__ == '__main__':
+    app.run()
